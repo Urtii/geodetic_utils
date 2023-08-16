@@ -1,21 +1,23 @@
 /*
   Use altitude from 'external_altitude' topic if messages are received
-  (To enable the messages arriving, publish to the topic by remapping in the launch file
-  Otherwise, altitude from GPS is taken
+  (To enable the messages arriving, publish to the topic by remapping in the
+  launch file Otherwise, altitude from GPS is taken
 */
 
+#include <geometry_msgs/PointStamped.h>
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
+#include <geometry_msgs/TransformStamped.h>
 #include <ros/ros.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/NavSatFix.h>
-#include <geometry_msgs/PoseWithCovarianceStamped.h>
-#include <geometry_msgs/TransformStamped.h>
-#include <geometry_msgs/PointStamped.h>
-#include <geodetic_utils/geodetic_conv.hpp>
 #include <std_msgs/Float64.h>
 #include <tf/transform_broadcaster.h>
 
+#include <geodetic_utils/geodetic_conv.hpp>
+
 bool g_is_sim;
 bool g_publish_pose;
+bool g_publish_pose_rviz;
 
 geodetic_converter::GeodeticConverter g_geodetic_converter;
 sensor_msgs::Imu g_latest_imu_msg;
@@ -24,6 +26,7 @@ bool g_got_imu;
 bool g_got_altitude;
 
 ros::Publisher g_gps_pose_pub;
+ros::Publisher g_gps_pose_rviz_pub;
 ros::Publisher g_gps_transform_pub;
 ros::Publisher g_gps_position_pub;
 
@@ -39,24 +42,20 @@ std::string g_tf_child_frame_id;
 
 std::shared_ptr<tf::TransformBroadcaster> p_tf_broadcaster;
 
-void imu_callback(const sensor_msgs::ImuConstPtr& msg)
-{
+void imu_callback(const sensor_msgs::ImuConstPtr& msg) {
   g_latest_imu_msg = *msg;
   g_got_imu = true;
 }
 
-void altitude_callback(const std_msgs::Float64ConstPtr& msg)
-{
+void altitude_callback(const std_msgs::Float64ConstPtr& msg) {
   // Only the z value in the PointStamped message is used
   g_latest_altitude_msg = *msg;
   g_got_altitude = true;
 }
 
-void gps_callback(const sensor_msgs::NavSatFixConstPtr& msg)
-{
-  if (!g_got_imu) {
+void gps_callback(const sensor_msgs::NavSatFixConstPtr& msg) {
+  if (g_got_imu) {
     ROS_WARN_STREAM_THROTTLE(1, "No IMU data yet");
-    return;
   }
 
   if (msg->status.status < sensor_msgs::NavSatStatus::STATUS_FIX) {
@@ -70,34 +69,48 @@ void gps_callback(const sensor_msgs::NavSatFixConstPtr& msg)
   }
 
   double x, y, z;
-  g_geodetic_converter.geodetic2Enu(msg->latitude, msg->longitude, msg->altitude, &x, &y, &z);
+  g_geodetic_converter.geodetic2Enu(msg->latitude, msg->longitude,
+                                    msg->altitude, &x, &y, &z);
 
   // (NWU -> ENU) for simulation
   if (g_is_sim) {
     double aux = x;
     x = y;
     y = -aux;
-    //z = z;
+    // z = z;
   }
 
   // Fill up pose message
   geometry_msgs::PoseWithCovarianceStampedPtr pose_msg(
       new geometry_msgs::PoseWithCovarianceStamped);
+  geometry_msgs::PoseStampedPtr pose_rviz_msg(new geometry_msgs::PoseStamped);
+
   pose_msg->header = msg->header;
   pose_msg->header.frame_id = g_frame_id;
   pose_msg->pose.pose.position.x = x;
   pose_msg->pose.pose.position.y = y;
   pose_msg->pose.pose.position.z = z;
-  pose_msg->pose.pose.orientation = g_latest_imu_msg.orientation;
+  if (g_got_imu)
+    pose_msg->pose.pose.orientation = g_latest_imu_msg.orientation;
+  else {
+    pose_msg->pose.pose.orientation.w = 1;
+    pose_msg->pose.pose.orientation.x = 0;
+    pose_msg->pose.pose.orientation.y = 0;
+    pose_msg->pose.pose.orientation.z = 0;
+  }
+
+  pose_rviz_msg->header = pose_msg->header;
+  pose_rviz_msg->pose.orientation = pose_msg->pose.pose.orientation;
+  pose_rviz_msg->pose.position = pose_msg->pose.pose.position;
 
   // Fill up position message
-  geometry_msgs::PointStampedPtr position_msg(
-    new geometry_msgs::PointStamped);
+  geometry_msgs::PointStampedPtr position_msg(new geometry_msgs::PointStamped);
   position_msg->header = pose_msg->header;
   position_msg->header.frame_id = g_frame_id;
   position_msg->point = pose_msg->pose.pose.position;
 
-  // If external altitude messages received, include in pose and position messages
+  // If external altitude messages received, include in pose and position
+  // messages
   if (g_got_altitude) {
     pose_msg->pose.pose.position.z = g_latest_altitude_msg.data;
     position_msg->point.z = g_latest_altitude_msg.data;
@@ -115,25 +128,32 @@ void gps_callback(const sensor_msgs::NavSatFixConstPtr& msg)
 
   // Take covariances from GPS
   if (g_trust_gps) {
-    if (msg->position_covariance_type == sensor_msgs::NavSatFix::COVARIANCE_TYPE_KNOWN
-        || msg->position_covariance_type == sensor_msgs::NavSatFix::COVARIANCE_TYPE_APPROXIMATED) {
+    if (msg->position_covariance_type ==
+            sensor_msgs::NavSatFix::COVARIANCE_TYPE_KNOWN ||
+        msg->position_covariance_type ==
+            sensor_msgs::NavSatFix::COVARIANCE_TYPE_APPROXIMATED) {
       // Fill in completely
       for (int i = 0; i <= 2; i++) {
         for (int j = 0; j <= 2; j++) {
-          pose_msg->pose.covariance[6 * i + j] = msg->position_covariance[3 * i + j];
+          pose_msg->pose.covariance[6 * i + j] =
+              msg->position_covariance[3 * i + j];
         }
       }
-    } else if (msg->position_covariance_type
-        == sensor_msgs::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN) {
+    } else if (msg->position_covariance_type ==
+               sensor_msgs::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN) {
       // Only fill in diagonal
       for (int i = 0; i <= 2; i++) {
-        pose_msg->pose.covariance[6 * i + i] = msg->position_covariance[3 * i + i];
+        pose_msg->pose.covariance[6 * i + i] =
+            msg->position_covariance[3 * i + i];
       }
     }
   }
 
   if (g_publish_pose) {
     g_gps_pose_pub.publish(pose_msg);
+  }
+  if (g_publish_pose_rviz) {
+    g_gps_pose_rviz_pub.publish(pose_rviz_msg);
   }
   g_gps_position_pub.publish(position_msg);
 
@@ -145,7 +165,14 @@ void gps_callback(const sensor_msgs::NavSatFixConstPtr& msg)
   transform_msg->transform.translation.x = x;
   transform_msg->transform.translation.y = y;
   transform_msg->transform.translation.z = z;
-  transform_msg->transform.rotation = g_latest_imu_msg.orientation;
+  if (g_got_imu)
+    transform_msg->transform.rotation = g_latest_imu_msg.orientation;
+  else {
+    transform_msg->transform.rotation.w = 1;
+    transform_msg->transform.rotation.x = 0;
+    transform_msg->transform.rotation.y = 0;
+    transform_msg->transform.rotation.z = 0;
+  }
 
   if (g_got_altitude) {
     transform_msg->transform.translation.z = g_latest_altitude_msg.data;
@@ -156,17 +183,18 @@ void gps_callback(const sensor_msgs::NavSatFixConstPtr& msg)
   // Fill up TF broadcaster
   tf::Transform transform;
   transform.setOrigin(tf::Vector3(x, y, z));
-  transform.setRotation(tf::Quaternion(g_latest_imu_msg.orientation.x,
-                                       g_latest_imu_msg.orientation.y,
-                                       g_latest_imu_msg.orientation.z,
-                                       g_latest_imu_msg.orientation.w));
-  p_tf_broadcaster->sendTransform(tf::StampedTransform(transform,
-                                                       ros::Time::now(),
-                                                       g_frame_id,
-                                                       g_tf_child_frame_id));
+  if (g_got_imu) {
+    transform.setRotation(tf::Quaternion(
+        g_latest_imu_msg.orientation.x, g_latest_imu_msg.orientation.y,
+        g_latest_imu_msg.orientation.z, g_latest_imu_msg.orientation.w));
+  } else {
+    transform.setRotation(tf::Quaternion(0, 0, 0, 1));
+  }
+  p_tf_broadcaster->sendTransform(tf::StampedTransform(
+      transform, ros::Time::now(), g_frame_id, g_tf_child_frame_id));
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   ros::init(argc, argv, "gps_to_pose_conversion_node");
   ros::NodeHandle nh;
   ros::NodeHandle pnh("~");
@@ -199,13 +227,13 @@ int main(int argc, char **argv) {
                     g_covariance_orientation_y, 0.02);
   ros::param::param("~fixed_covariance/orientation/z",
                     g_covariance_orientation_z, 0.11);
-  ros::param::param<std::string>("~frame_id",
-                                 g_frame_id, "world");
-  ros::param::param<std::string>("~tf_child_frame_id",
-                                 g_tf_child_frame_id, "gps_receiver");
+  ros::param::param<std::string>("~frame_id", g_frame_id, "world");
+  ros::param::param<std::string>("~tf_child_frame_id", g_tf_child_frame_id,
+                                 "gps_receiver");
 
   // Specify whether to publish pose or not
   ros::param::param("~publish_pose", g_publish_pose, false);
+  ros::param::param("~publish_pose", g_publish_pose_rviz, true);
 
   // Wait until GPS reference parameters are initialized.
   double latitude, longitude, altitude;
@@ -218,7 +246,7 @@ int main(int argc, char **argv) {
     } else {
       ROS_INFO(
           "GPS reference not ready yet, use set_gps_reference_node to set it");
-      ros::Duration(0.5).sleep(); // sleep for half a second
+      ros::Duration(0.5).sleep();  // sleep for half a second
     }
   } while (!g_geodetic_converter.isInitialised());
 
@@ -231,7 +259,8 @@ int main(int argc, char **argv) {
 
   // Initialize publishers
   g_gps_pose_pub =
-      nh.advertise<geometry_msgs::PoseWithCovarianceStamped>("gps_pose", 1);
+      nh.advertise<geometry_msgs::PoseWithCovarianceStamped>("gps_posewcov", 1);
+  g_gps_pose_rviz_pub = nh.advertise<geometry_msgs::PoseStamped>("gps_pose", 1);
   g_gps_transform_pub =
       nh.advertise<geometry_msgs::TransformStamped>("gps_transform", 1);
   g_gps_position_pub =
@@ -241,7 +270,7 @@ int main(int argc, char **argv) {
   ros::Subscriber imu_sub = nh.subscribe("imu", 1, &imu_callback);
   ros::Subscriber gps_sub = nh.subscribe("gps", 1, &gps_callback);
   ros::Subscriber altitude_sub =
-     nh.subscribe("external_altitude", 1, &altitude_callback);
+      nh.subscribe("external_altitude", 1, &altitude_callback);
 
   ros::spin();
 }
